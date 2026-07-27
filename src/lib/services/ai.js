@@ -5,9 +5,6 @@ import { prisma } from "@/lib/prisma";
 /**
  * Service to manage AI generations and interactions.
  */
-/**
- * Service to manage AI generations and interactions.
- */
 export const AIService = {
   /**
    * Calculate credit cost based on mode, model quality, and resolution
@@ -57,12 +54,15 @@ export const AIService = {
   /**
    * Execute a generation quest using muapi.ai
    */
-  async generate(userId, { mode, prompt, aspect_ratio = "16:9", resolution = "720p", duration = 8, model = "lite", image_url = null, last_image = null, images_list = [] }) {
-    // If it's reference mode, the cost depends on resolution, model is ignored by the API but we'll still use it for UI state
-    const cost = this.getCreditCost(mode, model, resolution);
-    await UserService.deductCredits(userId, cost);
+  async generate(userId, { mode, prompt, aspect_ratio = "16:9", resolution = "720p", duration = 8, model = "lite", image_url = null, last_image = null, images_list = [], customApiKey = null }) {
+    const isUsingCustomKey = Boolean(customApiKey && customApiKey.trim().length > 0);
+    const cost = isUsingCustomKey ? 0 : this.getCreditCost(mode, model, resolution);
 
-    const apiKey = config.ai.veo31.apiKey;
+    if (!isUsingCustomKey && cost > 0) {
+      await UserService.deductCredits(userId, cost);
+    }
+
+    const apiKey = isUsingCustomKey ? customApiKey.trim() : config.ai.veo31.apiKey;
     if (!apiKey) throw new Error("VEO31_API_KEY is not configured");
 
     let type;
@@ -95,7 +95,12 @@ export const AIService = {
     }
 
     if (type === "i2v") {
-      if (!image_url) throw new Error("image_url is required for image-to-video");
+      if (!image_url) {
+        if (!isUsingCustomKey && cost > 0) {
+          await UserService.addCredits(userId, cost);
+        }
+        throw new Error("image_url is required for image-to-video");
+      }
       payload.image_url = image_url;
       if (last_image) {
         payload.last_image = last_image;
@@ -103,65 +108,74 @@ export const AIService = {
     }
 
     if (type === "reference") {
-      if (!images_list || images_list.length === 0) throw new Error("images_list is required for reference-to-video");
+      if (!images_list || images_list.length === 0) {
+        if (!isUsingCustomKey && cost > 0) {
+          await UserService.addCredits(userId, cost);
+        }
+        throw new Error("images_list is required for reference-to-video");
+      }
       payload.images_list = images_list.slice(0, 3); // Max 3 images
     }
 
-    const submitRes = await fetch(submitUrl, {
-      method: "POST",
-      headers: {
-        "Content-Type": "application/json",
-        "x-api-key": apiKey,
-      },
-      body: JSON.stringify(payload),
-    });
-
-    if (!submitRes.ok) {
-      const errorText = await submitRes.text();
-      // Refund credits if submission fails
-      await UserService.addCredits(userId, cost);
-      throw new Error(`API Submission Failed: ${submitRes.status} ${errorText}`);
-    }
-
-    const { request_id } = await submitRes.json();
-    if (!request_id) {
-      await UserService.addCredits(userId, cost);
-      throw new Error("No request_id received from API");
-    }
-
-    const creationModel = prisma.creation || prisma.Creation;
-    if (creationModel) {
-      await creationModel.create({
-        data: {
-          userId,
-          prompt,
-          aspectRatio: aspect_ratio,
-          resolution,
-          duration: parseInt(duration),
-          model,
-          imageUrl: image_url,
-          lastImage: last_image,
-          imagesList: images_list.slice(0, 3),
-          requestId: request_id,
-          status: "processing",
-        }
+    try {
+      const submitRes = await fetch(submitUrl, {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json",
+          "x-api-key": apiKey,
+        },
+        body: JSON.stringify(payload),
       });
-    }
 
-    return { request_id };
+      if (!submitRes.ok) {
+        const errorText = await submitRes.text();
+        throw new Error(`API Submission Failed: ${submitRes.status} ${errorText}`);
+      }
+
+      const { request_id } = await submitRes.json();
+      if (!request_id) {
+        throw new Error("No request_id received from API");
+      }
+
+      const creationModel = prisma.creation || prisma.Creation;
+      if (creationModel) {
+        await creationModel.create({
+          data: {
+            userId,
+            prompt,
+            aspectRatio: aspect_ratio,
+            resolution,
+            duration: parseInt(duration),
+            model,
+            imageUrl: image_url,
+            lastImage: last_image,
+            imagesList: images_list.slice(0, 3),
+            requestId: request_id,
+            status: "processing",
+          }
+        });
+      }
+
+      return { request_id };
+    } catch (err) {
+      if (!isUsingCustomKey && cost > 0) {
+        await UserService.addCredits(userId, cost);
+      }
+      throw err;
+    }
   },
 
   /**
    * Wrapper for edit/reference to video if needed, currently mapping to generate
    */
-  async edit(userId, params) {
-    return this.generate(userId, params);
+  async edit(userId, params, customApiKey = null) {
+    return this.generate(userId, { ...params, customApiKey });
   },
 
   /**
    * Check status of a request and save to DB on completion
    */
-  async checkStatus(requestId, userId, metadata) {
+  async checkStatus(requestId, userId, metadata, customApiKey = null) {
     const creationModel = prisma.creation || prisma.Creation;
     if (!creationModel) return { status: "processing" };
 
@@ -174,7 +188,6 @@ export const AIService = {
     }
 
     if (creation.status === "completed") {
-      // Assuming Veo 3.1 returns video in videoFiles array from webhook
       return { status: "completed", videoUrl: creation.videoFiles?.[0] };
     }
 
@@ -182,8 +195,8 @@ export const AIService = {
       throw new Error(creation.error || "Generation failed.");
     }
 
-    // Direct upstream query as fallback for delayed webhooks
-    const apiKey = config.ai?.veo31?.apiKey;
+    const isUsingCustomKey = Boolean(customApiKey && customApiKey.trim().length > 0);
+    const apiKey = isUsingCustomKey ? customApiKey.trim() : config.ai?.veo31?.apiKey;
     if (apiKey) {
       try {
         const upstreamRes = await fetch(`https://api.muapi.ai/api/v1/predictions/${requestId}/result`, {
@@ -216,9 +229,11 @@ export const AIService = {
                 error: errStr
               }
             });
-            // Refund credits
-            const cost = this.getCreditCost(creation.mode, creation.model || "lite", creation.resolution || "720p");
-            await UserService.addCredits(userId, cost);
+            // Refund credits if not using custom key
+            if (!isUsingCustomKey) {
+              const cost = this.getCreditCost(creation.mode, creation.model || "lite", creation.resolution || "720p");
+              await UserService.addCredits(userId, cost);
+            }
             throw new Error(errStr);
           }
         }

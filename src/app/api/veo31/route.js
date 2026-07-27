@@ -18,6 +18,9 @@ export async function POST(req) {
       return NextResponse.json({ error: "Prompt is required" }, { status: 400 });
     }
 
+    const headerApiKey = req.headers.get("x-custom-api-key");
+    const customApiKey = headerApiKey || body.customApiKey || session.user.customApiKey || null;
+
     let result;
     if (mode === "reference-to-video") {
       result = await AIService.edit(session.user.id, {
@@ -27,7 +30,8 @@ export async function POST(req) {
         aspect_ratio,
         resolution,
         duration,
-        model
+        model,
+        customApiKey
       });
     } else {
       result = await AIService.generate(session.user.id, {
@@ -39,7 +43,8 @@ export async function POST(req) {
         model,
         image_url,
         last_image,
-        images_list
+        images_list,
+        customApiKey
       });
     }
 
